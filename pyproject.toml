@@ -5,24 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "micropki"
 version = "0.1.0"
-description = "MicroPKI - Sprint 1: self-signed Root CA with encrypted key storage, certificate generation, and audit logging."
+description = "Minimal PKI project with Root CA, Intermediate CA and end-entity certificate issuance"
 readme = "README.md"
-requires-python = ">=3.8"
-license = { text = "MIT" }
-authors = [{ name = "MicroPKI Student" }]
+requires-python = ">=3.12"
+license = "MIT"
 dependencies = [
-  "cryptography>=41.0.0",
+    "cryptography>=3.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=7.4.0",
-  "pytest-cov>=4.1.0",
+    "pytest>=7.0",
 ]
 
 [project.scripts]
 micropki = "micropki.cli:main"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"
+[tool.setuptools]
+packages = ["micropki"]

@@ -7,7 +7,6 @@ from cryptography import x509
 
 
 def _dt_iso_utc(dt: datetime) -> str:
-    """ISO 8601 UTC with 'Z'."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -23,15 +22,7 @@ def save_policy_file(
     purpose: str = "Root CA for MicroPKI demonstration",
     policy_version: str = "1.0",
 ) -> Path:
-    """
-    POL-1 required fields:
-      - CA Name (subject DN)
-      - Certificate Serial Number (hex)
-      - Validity period (NotBefore / NotAfter)
-      - Key algorithm and size
-      - Purpose statement
-      - Policy version and creation date
-    """
+
     out_dir = Path(out_dir)
     policy_path = out_dir / "policy.txt"
 
@@ -69,3 +60,39 @@ def save_policy_file(
         if logger:
             logger.error(f"Failed to create policy.txt: {e}")
         raise
+
+def append_intermediate_policy(
+    policy_path,
+    intermediate_cert,
+    issuer: str,
+    key_type: str,
+    key_size: int,
+    pathlen: int,
+):
+    serial_hex = hex(intermediate_cert.serial_number)
+
+    not_before = getattr(intermediate_cert, "not_valid_before_utc", None) or intermediate_cert.not_valid_before
+    not_after = getattr(intermediate_cert, "not_valid_after_utc", None) or intermediate_cert.not_valid_after
+
+    not_before = _dt_iso_utc(not_before)
+    not_after = _dt_iso_utc(not_after)
+
+    subject = intermediate_cert.subject.rfc4514_string()
+
+    section = f"""
+
+Intermediate CA Policy
+======================
+
+Subject DN: {subject}
+Serial Number (hex): {serial_hex}
+Validity NotBefore (UTC): {not_before}
+Validity NotAfter  (UTC): {not_after}
+Key Algorithm and Size: {key_type.upper()}-{key_size}
+Path Length Constraint: {pathlen}
+Issuer (Root CA): {issuer}
+
+"""
+
+    with open(policy_path, "a", encoding="utf-8") as f:
+        f.write(section)

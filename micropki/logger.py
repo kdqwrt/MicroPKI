@@ -3,19 +3,13 @@ import sys
 
 
 def setup_logger(log_file: str | None = None) -> logging.Logger:
-    """
-    Configure application logger.
 
-    Covers:
-    - LOG-1: log to file or stderr
-    - LOG-3: infrastructure safe for sensitive data
-    """
 
     logger = logging.getLogger("micropki")
     logger.setLevel(logging.INFO)
-    logger.propagate = False  # prevent duplicate logs
+    logger.propagate = False
 
-    # Remove existing handlers (important for tests)
+
     if logger.handlers:
         for handler in logger.handlers:
             logger.removeHandler(handler)

@@ -9,17 +9,13 @@ OID_MAP = {
     "C": NameOID.COUNTRY_NAME,
     "L": NameOID.LOCALITY_NAME,
     "ST": NameOID.STATE_OR_PROVINCE_NAME,
+    "EMAIL": NameOID.EMAIL_ADDRESS,
+    "E": NameOID.EMAIL_ADDRESS,
 }
 
 
 def parse_dn(dn_string: str) -> x509.Name:
-    """
-    Parse DN string into x509.Name.
 
-    Covers:
-    - PKI-2 (Subject handling)
-    - CLI-4 (validation)
-    """
 
     if not dn_string or not dn_string.strip():
         raise ValueError("Distinguished Name (--subject) must not be empty.")

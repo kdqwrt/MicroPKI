@@ -6,12 +6,11 @@ from pathlib import Path
 
 from .ca import init_ca, issue_intermediate_ca, issue_end_entity_certificate
 from .logger import setup_logger
-
 from .repository import CertificateRepository
-from .server import start_server
+from .revocation import revoke_certificate, generate_crl_for_ca
 import csv
 import json
-from datetime import datetime
+
 
 
 def _format_certificates_table(certs: list) -> str:
@@ -23,9 +22,9 @@ def _format_certificates_table(certs: list) -> str:
 
     for cert in certs:
         serial = cert['serial_hex'].replace('0x', '')[:16]
-        subject = cert['subject'][:50]  # Обрезаем длинные строки
+        subject = cert['subject'][:50]
         status = cert['status']
-        not_after = cert['not_after'][:10]  # Только дата
+        not_after = cert['not_after'][:10]
 
         rows.append([serial, subject, status, not_after])
 
@@ -77,10 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-
     ca_parser = subparsers.add_parser("ca", help="CA operations")
     ca_sub = ca_parser.add_subparsers(dest="ca_command", required=True)
-
 
     init_p = ca_sub.add_parser("init", help="Initialize Root CA")
     init_p.add_argument("--subject", required=True)
@@ -127,7 +124,6 @@ def build_parser() -> argparse.ArgumentParser:
     cert_p.add_argument("--csr")
     cert_p.add_argument("--db-path", default="./pki/micropki.db", help="Database path for automatic insertion")
 
-    # ca list-certs
     list_certs = ca_sub.add_parser("list-certs", help="List issued certificates")
     list_certs.add_argument("--status", choices=["valid", "revoked", "expired"], help="Filter by status")
     list_certs.add_argument("--issuer", help="Filter by issuer DN")
@@ -136,12 +132,31 @@ def build_parser() -> argparse.ArgumentParser:
     list_certs.add_argument("--db-path", default="./pki/micropki.db", help="Database path")
     list_certs.add_argument("--log-file", help="Log file path")
 
-    # ca show-cert
     show_cert = ca_sub.add_parser("show-cert", help="Show certificate by serial")
     show_cert.add_argument("serial", help="Certificate serial number (hex)")
     show_cert.add_argument("--format", choices=["pem", "text"], default="pem", help="Output format")
     show_cert.add_argument("--db-path", default="./pki/micropki.db", help="Database path")
     show_cert.add_argument("--log-file", help="Log file path")
+
+
+    revoke_p = ca_sub.add_parser("revoke", help="Revoke a certificate")
+    revoke_p.add_argument("serial", help="Certificate serial number (hex)")
+    revoke_p.add_argument("--crl", help="Path to CRL file to update")
+    revoke_p.add_argument("--reason", default="unspecified", help="Revocation reason")
+    revoke_p.add_argument("--force", action="store_true", help="Skip confirmation")
+    revoke_p.add_argument("--db-path", default="./pki/micropki.db", help="Database path")
+    revoke_p.add_argument("--log-file", help="Log file path")
+
+    gen_crl_p = ca_sub.add_parser("gen-crl", help="Generate CRL for a CA")
+    gen_crl_p.add_argument("--ca", required=True, choices=["root", "intermediate"], help="CA to generate CRL for")
+    gen_crl_p.add_argument("--ca-cert", help="Path to CA certificate (overrides --ca)")
+    gen_crl_p.add_argument("--ca-key", help="Path to CA private key (overrides --ca)")
+    gen_crl_p.add_argument("--ca-pass-file", help="Path to CA passphrase file (overrides --ca)")
+    gen_crl_p.add_argument("--next-update", type=int, default=7, help="Days until next update")
+    gen_crl_p.add_argument("--out-file", help="Output file path")
+    gen_crl_p.add_argument("--out-dir", default="./pki", help="PKI directory")
+    gen_crl_p.add_argument("--db-path", default="./pki/micropki.db", help="Database path")
+    gen_crl_p.add_argument("--log-file", help="Log file path")
 
     verify_p = ca_sub.add_parser("verify-chain", help="Validate leaf -> intermediate -> root chain")
     verify_p.add_argument("--root-cert", required=True)
@@ -153,7 +168,6 @@ def build_parser() -> argparse.ArgumentParser:
     db_parser = subparsers.add_parser("db", help="Database operations")
     db_sub = db_parser.add_subparsers(dest="db_command", required=True)
 
-    # db init
     db_init = db_sub.add_parser("init", help="Initialize certificate database")
     db_init.add_argument("--db-path", default="./pki/micropki.db", help="SQLite database path")
     db_init.add_argument("--force", action="store_true", help="Force reinitialization")
@@ -162,7 +176,6 @@ def build_parser() -> argparse.ArgumentParser:
     repo_parser = subparsers.add_parser("repo", help="Repository operations")
     repo_sub = repo_parser.add_subparsers(dest="repo_command", required=True)
 
-    # repo serve
     repo_serve = repo_sub.add_parser("serve", help="Start HTTP repository server")
     repo_serve.add_argument("--host", default="127.0.0.1", help="Bind address")
     repo_serve.add_argument("--port", type=int, default=8080, help="TCP port")
@@ -268,12 +281,6 @@ def validate_issue_intermediate_args(args: argparse.Namespace, logger=None) -> t
 
 
 def validate_issue_cert_args(args: argparse.Namespace, logger=None) -> tuple[bytes, Path]:
-    """
-    Валидирует аргументы для issue-cert.
-
-    Returns:
-        tuple[bytes, Path]: (passphrase, db_path)
-    """
     if not args.subject or not args.subject.strip():
         _die("--subject must be provided and non-empty.", logger)
 
@@ -291,7 +298,6 @@ def validate_issue_cert_args(args: argparse.Namespace, logger=None) -> tuple[byt
 
     _validate_writable_dir(args.out_dir, logger)
 
-    # Валидация SAN
     san_entries = args.san or []
 
     if args.template == "server":
@@ -314,13 +320,10 @@ def validate_issue_cert_args(args: argparse.Namespace, logger=None) -> tuple[byt
                     logger,
                 )
 
-    # Получаем passphrase
     passphrase = _read_passphrase_file(args.ca_pass_file, logger)
 
-    # Получаем путь к БД
     db_path = Path(getattr(args, 'db_path', './pki/micropki.db'))
 
-    # Проверяем существование БД и валидность схемы
     if db_path.exists():
         try:
             from .repository import CertificateRepository
@@ -341,7 +344,6 @@ def main() -> None:
 
     logger = setup_logger(getattr(args, "log_file", None))
 
-
     if args.command == "db" and args.db_command == "init":
         db_path = Path(args.db_path)
         repo = CertificateRepository(db_path, logger)
@@ -355,16 +357,12 @@ def main() -> None:
             _die(f"Database initialization failed: {e}", logger)
         return
 
-
-
     if args.command == "repo" and args.repo_command == "serve":
         db_path = Path(args.db_path)
         cert_dir = Path(args.cert_dir)
 
-
         if not cert_dir.exists():
             _die(f"Certificate directory not found: {cert_dir}", logger)
-
 
         repo = CertificateRepository(db_path, logger)
 
@@ -374,7 +372,6 @@ def main() -> None:
                 repo.init_db()
             except Exception as e:
                 _die(f"Failed to initialize database: {e}", logger)
-
 
         try:
             from .server import start_server
@@ -390,8 +387,6 @@ def main() -> None:
         except Exception as e:
             _die(f"Failed to start server: {e}", logger)
         return
-
-
 
     if args.command == "ca" and args.ca_command == "init":
         passphrase = validate_init_args(args, logger=logger)
@@ -413,7 +408,6 @@ def main() -> None:
         except Exception as e:
             _die(f"Root CA initialization failed: {e}", logger)
         return
-
 
     if args.command == "ca" and args.ca_command == "issue-intermediate":
         root_passphrase, intermediate_passphrase = validate_issue_intermediate_args(
@@ -445,7 +439,6 @@ def main() -> None:
         except Exception as e:
             _die(f"Intermediate CA issuance failed: {e}", logger)
         return
-
 
     if args.command == "ca" and args.ca_command == "issue-cert":
         ca_passphrase, db_path = validate_issue_cert_args(args, logger=logger)
@@ -506,7 +499,6 @@ def main() -> None:
             _die(f"Failed to list certificates: {e}", logger)
         return
 
-
     if args.command == "ca" and args.ca_command == "show-cert":
         db_path = Path(args.db_path)
 
@@ -523,7 +515,7 @@ def main() -> None:
 
             if args.format == "pem":
                 print(cert_data['cert_pem'])
-            else:  # text format
+            else:
                 print("=" * 60)
                 print("CERTIFICATE DETAILS")
                 print("=" * 60)
@@ -543,6 +535,83 @@ def main() -> None:
             _die(f"Failed to get certificate: {e}", logger)
         return
 
+    if args.command == "ca" and args.ca_command == "revoke":
+        db_path = Path(args.db_path)
+
+        if not db_path.exists():
+            _die(f"Database not found: {db_path}. Run 'micropki db init' first.", logger)
+
+        repo = CertificateRepository(db_path, logger)
+
+        if not args.force:
+            response = input(f"Revoke certificate {args.serial}? [y/N]: ")
+            if response.lower() not in ('y', 'yes'):
+                print("Revocation cancelled")
+                return
+
+        try:
+            revoke_certificate(
+                repo=repo,
+                serial_hex=args.serial,
+                reason=args.reason,
+                logger=logger,
+            )
+            print(f"Certificate {args.serial} revoked successfully")
+            logger.info(f"Certificate {args.serial} revoked with reason: {args.reason}")
+        except Exception as e:
+            _die(f"Revocation failed: {e}", logger)
+        return
+
+    if args.command == "ca" and args.ca_command == "gen-crl":
+        db_path = Path(args.db_path)
+        if not db_path.exists():
+            _die(f"Database not found: {db_path}. Run 'micropki db init' first.", logger)
+
+        repo = CertificateRepository(db_path, logger)
+        out_dir = Path(args.out_dir)
+
+        if args.ca_cert and args.ca_key and args.ca_pass_file:
+            ca_cert_path = Path(args.ca_cert)
+            ca_key_path = Path(args.ca_key)
+            ca_passphrase = _read_passphrase_file(args.ca_pass_file, logger)
+            ca_name = "custom"
+        else:
+            if args.ca == "root":
+                ca_cert_path = out_dir / "certs" / "ca.cert.pem"
+                ca_key_path = out_dir / "private" / "ca.key.pem"
+                ca_name = "root"
+            else:
+                ca_cert_path = out_dir / "certs" / "intermediate.cert.pem"
+                ca_key_path = out_dir / "private" / "intermediate.key.pem"
+                ca_name = "intermediate"
+
+            if not ca_cert_path.exists():
+                _die(f"CA certificate not found: {ca_cert_path}", logger)
+            if not ca_key_path.exists():
+                _die(f"CA private key not found: {ca_key_path}", logger)
+
+            if args.ca_pass_file:
+                ca_passphrase = _read_passphrase_file(args.ca_pass_file, logger)
+            else:
+                _die(f"--ca-pass-file is required when using --ca {args.ca}", logger)
+
+        try:
+            out_file = Path(args.out_file) if args.out_file else None
+            crl_path = generate_crl_for_ca(
+                ca_cert_path=ca_cert_path,
+                ca_key_path=ca_key_path,
+                ca_passphrase=ca_passphrase,
+                repo=repo,
+                out_dir=out_dir,
+                ca_name=ca_name,
+                next_update_days=args.next_update,
+                out_file=out_file,
+                logger=logger,
+            )
+            print(f"CRL generated successfully: {crl_path}")
+        except Exception as e:
+            _die(f"CRL generation failed: {e}", logger)
+        return
 
     if args.command == "ca" and args.ca_command == "verify-chain":
         try:
@@ -562,6 +631,5 @@ def main() -> None:
         print(f"   Leaf: {result['leaf_subject']}")
         return
 
-    # Если команда не распознана
     parser.print_help()
     raise SystemExit(1)

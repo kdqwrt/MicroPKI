@@ -1,11 +1,11 @@
-# micropki/database.py
+
 from __future__ import annotations
 
 import sqlite3
 import logging
-from datetime import datetime, timezone
+
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Tuple
 
 
 class CertificateDatabase:
@@ -13,7 +13,6 @@ class CertificateDatabase:
     SCHEMA_VERSION = 1
 
     def __init__(self, db_path: Path, logger: Optional[logging.Logger] = None):
-
         self.db_path = Path(db_path)
         self.logger = logger or logging.getLogger("micropki.db")
         self.conn: Optional[sqlite3.Connection] = None
@@ -22,9 +21,7 @@ class CertificateDatabase:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
-
         self.conn.execute("PRAGMA foreign_keys = ON")
-
         return self.conn
 
     def close(self):
@@ -33,13 +30,13 @@ class CertificateDatabase:
             self.conn = None
 
     def init_schema(self, force: bool = False) -> bool:
-
         try:
             self.connect()
 
             if not force and self._table_exists("certificates"):
-                self.logger.info("Database schema already exists, skipping initialization")
-                return True
+                self.logger.info("Database exists, running migrations...")
+                self.close()
+                return self.migrate_schema()
 
             if force:
                 self.logger.warning("Force mode enabled, dropping existing tables...")
@@ -62,11 +59,9 @@ class CertificateDatabase:
                 )
             """)
 
-
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_serial ON certificates(serial_hex)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON certificates(status)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_not_after ON certificates(not_after)")
-
 
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -81,7 +76,6 @@ class CertificateDatabase:
             )
 
             self.conn.commit()
-
             self.logger.info(f"Database schema initialized successfully at {self.db_path}")
             return True
 
@@ -142,22 +136,30 @@ class CertificateDatabase:
             self.close()
 
     def migrate_schema(self) -> bool:
-        current_version = self.get_schema_version()
+        try:
+            self.connect()
+            result = self.conn.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            current_version = int(result['value']) if result else 0
+        except sqlite3.OperationalError:
+            current_version = 0
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Failed to get schema version: {e}")
+            current_version = 0
 
         if current_version >= self.SCHEMA_VERSION:
             if self.logger:
                 self.logger.info(f"Schema is up to date (version {current_version})")
+            self.close()
             return True
 
         if self.logger:
             self.logger.info(f"Migrating schema from version {current_version} to {self.SCHEMA_VERSION}")
 
         try:
-            self.connect()
-
-            # Миграция с версии 0 до 1
             if current_version < 1:
-                # Создаем таблицу certificates если её нет
                 self.conn.execute("""
                     CREATE TABLE IF NOT EXISTS certificates (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,12 +176,10 @@ class CertificateDatabase:
                     )
                 """)
 
-                # Создаем индексы
                 self.conn.execute("CREATE INDEX IF NOT EXISTS idx_serial ON certificates(serial_hex)")
                 self.conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON certificates(status)")
                 self.conn.execute("CREATE INDEX IF NOT EXISTS idx_not_after ON certificates(not_after)")
 
-                # Создаем таблицу metadata
                 self.conn.execute("""
                     CREATE TABLE IF NOT EXISTS metadata (
                         key TEXT PRIMARY KEY,
@@ -187,7 +187,6 @@ class CertificateDatabase:
                     )
                 """)
 
-                # Устанавливаем версию
                 self.conn.execute(
                     "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
                     ("schema_version", "1")
@@ -201,7 +200,8 @@ class CertificateDatabase:
             return True
 
         except Exception as e:
-            self.conn.rollback()
+            if self.conn:
+                self.conn.rollback()
             if self.logger:
                 self.logger.error(f"Schema migration failed: {e}")
             raise

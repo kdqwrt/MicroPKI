@@ -1,4 +1,3 @@
-
 import pytest
 import time
 from micropki.serials import generate_certificate_serial_number, SerialNumberGenerator
@@ -92,3 +91,56 @@ class TestSerialNumberGenerator:
             serial = generate_certificate_serial_number()
             # Most significant bit of 20-byte number should be 0
             assert (serial >> 159) == 0
+
+    def test_serial_uniqueness_with_database(self, tmp_path):
+        """Test that 100 serial numbers are unique when stored to database."""
+        from micropki.database import CertificateDatabase
+
+        db_path = tmp_path / "test.db"
+        db = CertificateDatabase(db_path)
+        db.init_schema()
+
+        gen = SerialNumberGenerator()
+        db.connect()
+
+        serials_generated = []
+
+        # Generate and store 100 certificates with unique serials
+        for i in range(100):
+            serial = gen.generate()
+            serials_generated.append(serial)
+            serial_hex = f"0x{serial:x}"
+
+            db.execute("""
+                INSERT INTO certificates 
+                (serial_hex, subject, issuer, not_before, not_after, cert_pem, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                serial_hex,
+                f"CN=test{i}.example.com",
+                "CN=Test CA",
+                "2024-01-01T00:00:00Z",
+                "2025-01-01T00:00:00Z",
+                f"-----BEGIN CERTIFICATE-----\nMIID...test{i}\n-----END CERTIFICATE-----",
+                "valid",
+                "2024-01-01T00:00:00Z"
+            ))
+            db.commit()
+
+        # Verify all 100 records were inserted
+        cursor = db.execute("SELECT COUNT(*) FROM certificates")
+        count = cursor.fetchone()[0]
+        assert count == 100, f"Expected 100 certificates, found {count}"
+
+        # Verify all serials in DB are unique
+        cursor = db.execute("SELECT serial_hex FROM certificates")
+        db_serials = [row[0] for row in cursor.fetchall()]
+        assert len(db_serials) == len(set(db_serials)), "Duplicate serials found in database"
+
+        # Verify our generated serials match what's in DB
+        for serial in serials_generated:
+            serial_hex = f"0x{serial:x}"
+            cursor = db.execute("SELECT * FROM certificates WHERE serial_hex = ?", (serial_hex,))
+            assert cursor.fetchone() is not None, f"Serial {serial_hex} not found in database"
+
+        db.close()
